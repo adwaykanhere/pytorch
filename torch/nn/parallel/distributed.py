@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import copy
 import itertools
+import inspect
 
 import torch
 
@@ -541,6 +542,12 @@ class DistributedDataParallel(Module):
         for module in self._module_copies[1:]:
             module.train(mode)
 
+    # Communication hook is an enhancement that provides a hook which can be
+    # used to implement various Gradient Compression algorithms.
+    def register_comm_hook(self, state: object, hook: callable):
+        self._check_comm_hook(hook)
+        self.reducer.register_comm_hook(state, hook)
+
     def _distributed_broadcast_coalesced(self, tensors, buffer_size):
         dist._broadcast_coalesced(self.process_group, tensors, buffer_size)
 
@@ -599,3 +606,22 @@ class DistributedDataParallel(Module):
                     assert self.device_type != 'cpu', "SyncBatchNorm layers only work with GPU modules"
                     layer._specify_ddp_gpu_num(
                         len(self.device_ids) if self.device_ids else 1)
+
+    def _check_comm_hook(self, hook):
+        assert callable(hook), "Communication hook must be callable."
+
+        sig = inspect.signature(hook)
+        assert (sig.parameters['state'].annotation != inspect._empty and
+                sig.parameters['bucket'].annotation != inspect._empty and
+                sig.return_annotation != inspect._empty), (
+                    "Communication hook is missing annotations."
+        )
+        assert sig.parameters['state'].annotation == object, (
+            "Communication hook: state annotation is not object."
+        )
+        assert sig.parameters['bucket'].annotation == dist.GradBucket, (
+            "Communication hook: bucket annotation is not dist.GradBucket."
+        )
+        assert sig.return_annotation == torch.futures.Future, (
+            "Communication hook: return annotation is not torch.futures.Future."
+        )

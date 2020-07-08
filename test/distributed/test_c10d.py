@@ -2989,6 +2989,134 @@ class DistributedDataParallelTest(MultiProcessTestCase):
             with self.assertRaisesRegex(RuntimeError, ".* appears not to match strides of the same param in process 0"):
                 m_ddp = DistributedDataParallel(m, device_ids=[dev0], process_group=process_group)
 
+    @requires_gloo()
+    def test_ddp_comm_hook_future_passing(self):
+        """
+        This unit test verifies whether the Future object is passed properly.
+        The callback function creates a Future object and sets a value to it.
+        """
+        class test_ddp_comm_hook(nn.Module):
+            def __init__(self):
+                super(test_ddp_comm_hook, self).__init__()
+                self.t0 = Task()
+
+            def forward(self, x, rank):
+                return self.t0(x + rank)
+
+        def simple_hook(state: object, bucket: dist.GradBucket) -> torch.futures.Future:
+            fut = torch.futures.Future()
+            fut_result = []
+            # Outside then callback, set the result to all zeros.
+            fut.set_result([torch.zeros_like(t) for t in bucket.get_tensors()])
+
+            def fut_then(fut):
+                # Return all ones, something different from what fut has at its result.
+                return [torch.ones_like(t) for t in bucket.get_tensors()]
+
+            return fut.then(fut_then)
+
+        store = c10d.FileStore(self.file_name, self.world_size)
+        process_group = c10d.ProcessGroupGloo(store, self.rank, self.world_size)
+
+        # Test on CPU
+        model = DistributedDataParallel(
+            test_ddp_comm_hook().cpu(),
+            process_group=process_group
+        )
+        # Register DDP Communication Hook
+        model.register_comm_hook(None, simple_hook)
+
+        # Run forward
+        output = model(8, self.rank)
+
+        # Run backward
+        output.mean().backward()
+
+        # check whether the grads are equal to what then callback returns.
+        # without the comm_hook expected result would be 0.25 * torch.ones(2, 2).
+        [self.assertEqual(p.grad, torch.ones(2, 2)) for p in model.parameters()]
+
+    @requires_gloo()
+    def test_ddp_comm_hook_funtion_checks(self):
+        """
+        This unit test makes sure that register_comm_hook properly checks the format
+        of hook defined by user. The Python hook must be callable and defined with
+        annotations. This test also checks whether type of annotations checked properly.
+        """
+        store = c10d.FileStore(self.file_name, self.world_size)
+        process_group = c10d.ProcessGroupGloo(store, self.rank, self.world_size)
+
+        model = DistributedDataParallel(
+            torch.nn.Linear(10, 5),
+            process_group=process_group
+        )
+
+        try:
+            got_exception = False
+            model.register_comm_hook(state=None, hook=1)
+        except Exception as e:
+            if "Communication hook must be callable." in str(e):
+                got_exception = True
+            else:
+                raise e
+        if not got_exception:
+            raise Exception('Communication hook callable check is missing.')
+
+        try:
+            got_exception = False
+
+            def comm_hook(state: object, bucket) -> torch.futures.Future:
+                return torch.futures.Future()
+            model.register_comm_hook(state=None, hook=comm_hook)
+        except Exception as e:
+            if "Communication hook is missing annotations." in str(e):
+                got_exception = True
+            else:
+                raise e
+        if not got_exception:
+            raise Exception('Communication hook annotation check is missing.')
+
+        try:
+            got_exception = False
+
+            def comm_hook(state: int, bucket: dist.GradBucket) -> torch.futures.Future:
+                return torch.futures.Future()
+            model.register_comm_hook(state=None, hook=comm_hook)
+        except Exception as e:
+            if "Communication hook: state annotation is not object." in str(e):
+                got_exception = True
+            else:
+                raise e
+        if not got_exception:
+            raise Exception('Communication hook object type check is missing.')
+
+        try:
+            got_exception = False
+
+            def comm_hook(state: object, bucket: int) -> torch.futures.Future:
+                return torch.futures.Future()
+            model.register_comm_hook(state=None, hook=comm_hook)
+        except Exception as e:
+            if "Communication hook: bucket annotation is not dist.GradBucket." in str(e):
+                got_exception = True
+            else:
+                raise e
+        if not got_exception:
+            raise Exception('Communication hook bucket type check is missing.')
+
+        try:
+            got_exception = False
+
+            def comm_hook(state: object, bucket: dist.GradBucket) -> int:
+                return torch.futures.Future()
+            model.register_comm_hook(state=None, hook=comm_hook)
+        except Exception as e:
+            if "Communication hook: return annotation is not torch.futures.Future." in str(e):
+                got_exception = True
+            else:
+                raise e
+        if not got_exception:
+            raise Exception('Communication hook return type check is missing.')
 
 class ReducerModule(nn.Module):
     def __init__(self):
@@ -3124,6 +3252,29 @@ class ReducerTest(TestCase):
             reducer.prepare_for_backward(output)
             output.backward()
             optimizer.step()
+
+    def test_ddp_comm_hook_register_just_once(self):
+        """
+        DDP communication hook can only be registered once. This test validates whether
+        the error is thrown properly when register_comm_hook is called more than once.
+        """
+        model = self._create_mixed_precision_model()
+        reducer = self._create_reducer_for_models([model], find_unused_parameters=True)
+
+        def dummy_hook(state, bucket):
+            fut = torch.futures.Future()
+            fut.set_result(bucket.get_tensors())
+            return fut.then()
+        reducer.register_comm_hook(None, dummy_hook)
+        try:
+            reducer.register_comm_hook(None, dummy_hook)
+        except Exception as e:
+            if "register_comm_hook can only be called once" in str(e):
+                return
+            else:
+                raise e
+        raise Exception('Communication hook multiple register check is missing in reducer.')
+
 
 
 class ComputeBucketAssignmentTest(TestCase):
